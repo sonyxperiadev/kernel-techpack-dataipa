@@ -8270,9 +8270,6 @@ static void ipa3_load_ipa_fw(struct work_struct *work)
 		return;
 	}
 	IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
-	mutex_lock(&ipa3_ctx->fw_load_data.lock);
-	ipa3_ctx->fw_load_data.state = IPA_FW_LOAD_STATE_LOADED;
-	mutex_unlock(&ipa3_ctx->fw_load_data.lock);
 	pr_info("IPA FW loaded successfully\n");
 
 	result = ipa3_post_init(&ipa3_res, ipa3_ctx->cdev.dev);
@@ -8311,58 +8308,6 @@ static void ipa3_load_ipa_fw(struct work_struct *work)
 		}
 		IPADBG("IPA uC loading succeeded\n");
 	}
-}
-
-static void ipa_fw_load_sm_handle_event(enum ipa_fw_load_event ev)
-{
-	mutex_lock(&ipa3_ctx->fw_load_data.lock);
-
-	IPADBG("state=%d event=%d\n", ipa3_ctx->fw_load_data.state, ev);
-
-	if (ev == IPA_FW_LOAD_EVNT_FWFILE_READY) {
-		if (ipa3_ctx->fw_load_data.state == IPA_FW_LOAD_STATE_INIT) {
-			ipa3_ctx->fw_load_data.state =
-				IPA_FW_LOAD_STATE_FWFILE_READY;
-			goto out;
-		}
-		if (ipa3_ctx->fw_load_data.state ==
-			IPA_FW_LOAD_STATE_SMMU_DONE) {
-			ipa3_ctx->fw_load_data.state =
-				IPA_FW_LOAD_STATE_LOAD_READY;
-			goto sched_fw_load;
-		}
-		IPAERR("ignore multiple requests to load FW\n");
-		goto out;
-	}
-	if (ev == IPA_FW_LOAD_EVNT_SMMU_DONE) {
-		if (ipa3_ctx->fw_load_data.state == IPA_FW_LOAD_STATE_INIT) {
-			ipa3_ctx->fw_load_data.state =
-				IPA_FW_LOAD_STATE_SMMU_DONE;
-			goto sched_fw_load;
-		}
-		if (ipa3_ctx->fw_load_data.state ==
-			IPA_FW_LOAD_STATE_FWFILE_READY) {
-			ipa3_ctx->fw_load_data.state =
-				IPA_FW_LOAD_STATE_LOAD_READY;
-			goto sched_fw_load;
-		}
-		IPAERR("ignore multiple smmu done events\n");
-		goto out;
-	}
-	IPAERR("invalid event ev=%d\n", ev);
-	mutex_unlock(&ipa3_ctx->fw_load_data.lock);
-	ipa_assert();
-	return;
-
-out:
-	mutex_unlock(&ipa3_ctx->fw_load_data.lock);
-	return;
-
-sched_fw_load:
-	IPADBG("Scheduled a work to load IPA FW\n");
-	mutex_unlock(&ipa3_ctx->fw_load_data.lock);
-	queue_work(ipa3_ctx->transport_power_mgmt_wq,
-		&ipa3_fw_loading_work);
 }
 
 static ssize_t ipa3_write(struct file *file, const char __user *buf,
@@ -8461,8 +8406,17 @@ static ssize_t ipa3_write(struct file *file, const char __user *buf,
 	if (ipa3_is_ready())
 		return count;
 
-	ipa_fw_load_sm_handle_event(IPA_FW_LOAD_EVNT_FWFILE_READY);
+	/* Prevent multiple calls from trying to load the FW again. */
+	if (ipa3_ctx->fw_loaded) {
+		IPAERR("not load FW again\n");
+		return count;
+	}
 
+	/* Schedule WQ to load ipa-fws */
+	ipa3_ctx->fw_loaded = true;
+	queue_work(ipa3_ctx->transport_power_mgmt_wq,
+		&ipa3_fw_loading_work);
+	IPADBG("Scheduled a work to load IPA FW\n");
 	return count;
 }
 
@@ -8880,11 +8834,6 @@ static int ipa3_pre_init(const struct ipa3_plat_drv_res *resource_p,
 		result = -ENOMEM;
 		goto fail_mem_ctx;
 	}
-	/* If SMMU not support fw load state will be updated
-	 * in probe function. Avoid overwriting in pre-init function */
-	if (ipa3_ctx->fw_load_data.state != IPA_FW_LOAD_STATE_SMMU_DONE)
-		ipa3_ctx->fw_load_data.state = IPA_FW_LOAD_STATE_INIT;
-	mutex_init(&ipa3_ctx->fw_load_data.lock);
 
 	ipa3_ctx->logbuf = ipc_log_context_create(IPA_IPC_LOG_PAGES, "ipa", MINIDUMP_MASK);
 	if (ipa3_ctx->logbuf == NULL)
@@ -11175,56 +11124,6 @@ static int ipa3_smp2p_probe(struct device *dev)
 	return 0;
 }
 
-static int ipa_smmu_update_fw_loader(void)
-{
-	int i, result;
-	int cnt = 0;
-
-	if (smmu_info.arm_smmu) {
-		IPADBG("smmu is enabled\n");
-		for (i = 0; i < IPA_SMMU_CB_MAX; i++) {
-			if (!smmu_info.present[i]) {
-				IPADBG("CB %d not probed yet\n", i);
-			} else {
-				cnt++;
-				IPADBG("CB %d probed\n", i);
-			}
-		}
-		if (cnt == IPA_SMMU_CB_MAX ||
-			ipa3_ctx->num_smmu_cb_probed ==
-			ipa3_ctx->max_num_smmu_cb) {
-			IPADBG("All %d CBs probed\n", IPA_SMMU_CB_MAX);
-
-			if (ipa3_ctx->use_xbl_boot) {
-				IPAERR("Using XBL boot load for IPA FW\n");
-				mutex_lock(&ipa3_ctx->fw_load_data.lock);
-				ipa3_ctx->fw_load_data.state = IPA_FW_LOAD_STATE_LOADED;
-				mutex_unlock(&ipa3_ctx->fw_load_data.lock);
-
-				result = ipa3_attach_to_smmu();
-				if (result) {
-					IPAERR("IPA attach to smmu failed %d\n",
-						result);
-					return result;
-				}
-
-				result = ipa3_post_init(&ipa3_res, ipa3_ctx->cdev.dev);
-				if (result) {
-					IPAERR("IPA post init failed %d\n", result);
-					return result;
-				}
-			} else {
-
-				ipa_fw_load_sm_handle_event(IPA_FW_LOAD_EVNT_SMMU_DONE);
-			}
-		}
-	} else {
-		IPADBG("smmu is disabled\n");
-	}
-
-	return 0;
-}
-
 int ipa3_plat_drv_probe(struct platform_device *pdev_p)
 {
 	int result;
@@ -11277,7 +11176,7 @@ int ipa3_plat_drv_probe(struct platform_device *pdev_p)
 		cb->dev = dev;
 		smmu_info.present[IPA_SMMU_CB_AP] = true;
 		ipa3_ctx->num_smmu_cb_probed++;
-		return ipa_smmu_update_fw_loader();
+		return 0;
 	}
 
 	if (of_device_is_compatible(dev->of_node, "qcom,ipa-smmu-wlan-cb")) {
@@ -11289,7 +11188,7 @@ int ipa3_plat_drv_probe(struct platform_device *pdev_p)
 		cb->dev = dev;
 		smmu_info.present[IPA_SMMU_CB_WLAN] = true;
 		ipa3_ctx->num_smmu_cb_probed++;
-		return ipa_smmu_update_fw_loader();
+		return 0;
 	}
 
 	if (of_device_is_compatible(dev->of_node, "qcom,ipa-smmu-wlan1-cb")) {
@@ -11301,7 +11200,7 @@ int ipa3_plat_drv_probe(struct platform_device *pdev_p)
 		cb->dev = dev;
 		smmu_info.present[IPA_SMMU_CB_WLAN1] = true;
 		ipa3_ctx->num_smmu_cb_probed++;
-		return ipa_smmu_update_fw_loader();
+		return 0;
 	}
 
 	if (of_device_is_compatible(dev->of_node, "qcom,ipa-smmu-eth-cb")) {
@@ -11313,7 +11212,7 @@ int ipa3_plat_drv_probe(struct platform_device *pdev_p)
 		cb->dev = dev;
 		smmu_info.present[IPA_SMMU_CB_ETH] = true;
 		ipa3_ctx->num_smmu_cb_probed++;
-		return ipa_smmu_update_fw_loader();
+		return 0;
 	}
 
 	if (of_device_is_compatible(dev->of_node, "qcom,ipa-smmu-eth1-cb")) {
@@ -11325,7 +11224,7 @@ int ipa3_plat_drv_probe(struct platform_device *pdev_p)
 		cb->dev = dev;
 		smmu_info.present[IPA_SMMU_CB_ETH1] = true;
 		ipa3_ctx->num_smmu_cb_probed++;
-		return ipa_smmu_update_fw_loader();
+		return 0;
 	}
 
 	if (of_device_is_compatible(dev->of_node, "qcom,ipa-smmu-uc-cb")) {
@@ -11337,7 +11236,7 @@ int ipa3_plat_drv_probe(struct platform_device *pdev_p)
 		cb->dev = dev;
 		smmu_info.present[IPA_SMMU_CB_UC] = true;
 		ipa3_ctx->num_smmu_cb_probed++;
-		return ipa_smmu_update_fw_loader();
+		return 0;
 	}
 
 	if (of_device_is_compatible(dev->of_node, "qcom,ipa-smmu-11ad-cb")) {
@@ -11349,7 +11248,7 @@ int ipa3_plat_drv_probe(struct platform_device *pdev_p)
 		cb->dev = dev;
 		smmu_info.present[IPA_SMMU_CB_11AD] = true;
 		ipa3_ctx->num_smmu_cb_probed++;
-		return ipa_smmu_update_fw_loader();
+		return 0;
 	}
 
 	if (of_device_is_compatible(dev->of_node,
@@ -11414,7 +11313,6 @@ int ipa3_plat_drv_probe(struct platform_device *pdev_p)
 			IPAERR("ipa3_init failed\n");
 			goto err_check;
 		}
-		ipa_fw_load_sm_handle_event(IPA_FW_LOAD_EVNT_SMMU_DONE);
 		goto skip_repeat_pre_init;
 	}
 
